@@ -1,0 +1,7 @@
+streamlit run main.py
+
+.\ngrok config add-316eUs1Mgr5i8zSV0sIzObAaBYq_7kciiAfpVUq8LtC4wkzDy
+.\ngrok http 8501
+
+
+uvicorn api:app --reload --port 8000

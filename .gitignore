@@ -1,0 +1,22 @@
+# 1. Python & Virtual Environment (Never upload these)
+__pycache__/
+myenv/
+*.pyc
+
+# 2. Privacy & Data (Your photos and the security logs)
+known_faces/
+security_logs/
+
+# 3. The "Database" File (This contains biometric data)
+face_signatures.pkl
+
+# 4. Temporary Files (Created while the app runs)
+temp_live.jpg
+temp_test.jpg
+temp_upload.jpg
+
+# 5. Executables (Large files people should download themselves)
+ngrok.exe
+
+# 6. Windows System Junk
+Thumbs.db
