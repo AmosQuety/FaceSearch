@@ -6,6 +6,7 @@ myenv/
 # 2. Privacy & Data (Your photos and the security logs)
 known_faces/
 security_logs/
+storage/
 
 # 3. The "Database" File (This contains biometric data)
 face_signatures.pkl

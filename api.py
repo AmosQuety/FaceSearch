@@ -1,125 +1,137 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
-import shutil
 import os
+import pickle
 from deepface import DeepFace
 from scipy.spatial.distance import cosine
-import utils # We reuse the existing logic!
 
-# Initialize the App
-app = FastAPI(title="Westeros Biometric API", description="The Backend for the face recognition system", version="1.0")
+app = FastAPI(title="Biometric API")
 
-# Load the database into memory when the server starts
-face_db = utils.load_database()
+STORAGE_ROOT = "storage"
+GLOBAL_DIR = "_global_login" # Special folder for login faces
+
+# --- HELPER: Smart Path Selector ---
+def get_storage_path(user_id: str, workspace_id: str):
+    # If it's for the Login System, use the special global folder
+    if workspace_id == "global":
+        path = os.path.join(STORAGE_ROOT, GLOBAL_DIR)
+    else:
+        # Otherwise, use the User's specific Workspace folder
+        path = os.path.join(STORAGE_ROOT, user_id, workspace_id)
+    
+    if not os.path.exists(path):
+        os.makedirs(path)
+    return path
+
+# --- HELPER: Load DB ---
+def load_db(path):
+    pkl_path = os.path.join(path, "embeddings.pkl")
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            return pickle.load(f)
+    return {}
+
+# --- HELPER: Save DB ---
+def save_db(path, database):
+    pkl_path = os.path.join(path, "embeddings.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(database, f)
 
 @app.get("/")
 def home():
-    """Health Check Endpoint"""
-    return {"status": "online", "system": "Westeros Gatekeeper v1.0"}
+    return {"status": "online", "system": "Hybrid (Global + Workspace) Engine"}
+
+@app.post("/register")
+async def register_face(
+    name: str = Form(...), 
+    user_id: str = Form(...),
+    workspace_id: str = Form(...),
+    file: UploadFile = File(...)
+):
+    try:
+        # 1. Determine where to save
+        target_path = get_storage_path(user_id, workspace_id)
+        
+        # 2. Save Image
+        # If global, name MUST be unique (usually the User ID or Email)
+        safe_name = "".join([c for c in name if c.isalpha() or c.isdigit() or c=='_' or c=='.' or c=='@']).strip()
+        img_path = os.path.join(target_path, f"{safe_name}.jpg")
+
+        with open(img_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        # 3. Embedding
+        embeddings = DeepFace.represent(img_path, model_name="Facenet512", enforce_detection=False)
+        embedding_vector = embeddings[0]["embedding"]
+
+        # 4. Update Index
+        db = load_db(target_path)
+        db[safe_name] = embedding_vector
+        save_db(target_path, db)
+
+        return {"status": "success", "message": "Enrolled successfully", "total_faces": len(db)}
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.post("/verify")
-async def verify_user(file: UploadFile = File(...)):
-    """
-    The Main Gate:
-    1. Checks Liveness (Smile)
-    2. Checks Identity (Vector Search)
-    3. Returns JSON to the Mobile App
-    """
-    
-    # 1. Save the uploaded file temporarily
-    temp_filename = f"temp_{file.filename}"
-    with open(temp_filename, "wb") as buffer:
-        content = await file.read() # Read the bytes
-        buffer.write(content)
-
+async def verify_face(
+    user_id: str = Form(default="unknown"), # Optional for global login
+    workspace_id: str = Form(...),
+    file: UploadFile = File(...)
+):
     try:
-        # --- PHASE 1: LIVENESS CHECK ---
-        # Note: We enforce the "happy" or "surprise" rule here
-        analysis = DeepFace.analyze(temp_filename, actions=['emotion'], enforce_detection=False)
-        if isinstance(analysis, list): analysis = analysis[0]
-        
-        emotion = analysis['dominant_emotion']
-        print(f"DEBUG: Detected Emotion: {emotion}")
+        # 1. Save temp
+        temp_filename = f"temp_{file.filename}"
+        with open(temp_filename, "wb") as buffer:
+            buffer.write(await file.read())
 
-        # Security Rule (You can add 'neutral' here if you want to relax it)
-        if emotion not in ['happy', 'surprise']:
-            # Log the Intruder
-            utils.log_intrusion(content, f"Liveness_Failed_({emotion})")
+        # 2. Liveness
+        try:
+            analysis = DeepFace.analyze(temp_filename, actions=['emotion'], enforce_detection=False)
+            emotion = analysis[0]['dominant_emotion'] if isinstance(analysis, list) else analysis['dominant_emotion']
             
-            # Return JSON Error
-            return JSONResponse(
-                status_code=401, 
-                content={
-                    "access": "DENIED", 
-                    "error": "Liveness Check Failed", 
+            # Allow neutral for easier testing
+            if emotion not in ['happy', 'surprise', 'neutral']:
+                os.remove(temp_filename)
+                return JSONResponse(status_code=401, content={
+                    "access": "DENIED", "error": "Liveness Failed", 
                     "message": f"User looked '{emotion}'. Smile required."
-                }
-            )
+                })
+        except:
+            emotion = "unknown"
 
-        # --- PHASE 2: FACE RECOGNITION ---
-        target_embedding = DeepFace.represent(
-            temp_filename, 
-            model_name=utils.MODEL_NAME, 
-            enforce_detection=False
-        )[0]["embedding"]
+        # 3. Recognition
+        target_embedding = DeepFace.represent(temp_filename, model_name="Facenet512", enforce_detection=False)[0]["embedding"]
+        os.remove(temp_filename)
 
+        # 4. Load Correct DB
+        target_path = get_storage_path(user_id, workspace_id)
+        db = load_db(target_path)
+
+        # 5. Search
         best_match = "Unknown"
         best_score = 1.0
         
-        for name, db_embedding in face_db.items():
+        for name, db_embedding in db.items():
             score = cosine(target_embedding, db_embedding)
             if score < best_score:
                 best_score = score
                 best_match = name
 
-        # Cleanup: Delete the temp file
-        os.remove(temp_filename)
-
-        # --- DECISION ---
+        # 6. Result
         if best_score < 0.4:
             return {
                 "access": "GRANTED",
-                "user": best_match.replace("_", " "),
+                "user": best_match, # This will be the UserID/Email if using Global
                 "confidence": round((1 - best_score) * 100, 2),
                 "emotion_detected": emotion
             }
         else:
-            # Log the Stranger
-            utils.log_intrusion(content, "Unknown_Intruder")
-            
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "access": "DENIED", 
-                    "error": "Identity Unknown", 
-                    "best_guess": best_match,
-                    "score": round(best_score, 2)
-                }
-            )
+            return JSONResponse(status_code=401, content={
+                "access": "DENIED", "error": "Identity Unknown", "score": round(best_score, 2)
+            })
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-@app.post("/register")
-async def register_user(name: str = Form(...), file: UploadFile = File(...)):
-    """
-    Admin Endpoint to add new users via API
-    """
-    # Read image
-    content = await file.read()
-    
-    # Save to known_faces using your util logic (manually implementing here for API)
-    safe_name = "".join([c for c in name if c.isalpha() or c.isdigit() or c==' ']).strip().replace(" ", "_")
-    save_path = os.path.join(utils.DB_FOLDER, f"{safe_name}.jpg")
-    
-    with open(save_path, "wb") as f:
-        f.write(content)
-    
-    # Trigger Retrain
-    count = utils.retrain_database()
-    
-    # Reload the global variable so the API knows the new person immediately
-    global face_db
-    face_db = utils.load_database()
-    
-    return {"status": "success", "message": f"Added {safe_name}", "total_faces": count}
