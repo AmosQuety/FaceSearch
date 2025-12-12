@@ -155,7 +155,7 @@ async def analyze_face(file: UploadFile = File(...)):
         # actions: age, gender, race, emotion
         results = DeepFace.analyze(
             img_path=temp_filename, 
-            actions=['age', 'gender', 'emotion'],
+            actions=[ 'emotion'],
             enforce_detection=False
         )
 
@@ -172,14 +172,23 @@ async def analyze_face(file: UploadFile = File(...)):
         return {
             "success": True,
             "data": {
-                "age": result.get("age"),
-                "gender": result.get("dominant_gender"),
-                "emotion": result.get("dominant_emotion"),
-                "emotion_score": result["emotion"][result["dominant_emotion"]]
+                 # Convert numpy types to standard python types
+                # "age": int(result.get("age")), 
+                # "gender": str(result.get("dominant_gender")),
+                "age": 25,          # Placeholder
+                "gender": "unknown",# Placeholder
+                "emotion": str(result.get("dominant_emotion")),
+                "emotion_score": float(result["emotion"][result["dominant_emotion"]]) 
             }
         }
 
     except Exception as e:
+        # Print the ACTUAL error to the terminal so we can see it
+        import traceback
+        traceback.print_exc()
+        
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 
