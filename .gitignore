@@ -2,6 +2,8 @@
 __pycache__/
 myenv/
 *.pyc
+.env
+
 
 # 2. Privacy & Data (Your photos and the security logs)
 known_faces/

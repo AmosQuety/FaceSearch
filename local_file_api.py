@@ -1,32 +1,51 @@
-import os
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
+import os
+import pickle
+import cv2
+import numpy as np
+import base64
+
+from scipy.spatial.distance import cosine
+os.environ["DEEPFACE_HOME"] = "F:\\Amos\\AI_models"
+
 from deepface import DeepFace
-from supabase import create_client, Client
-from dotenv import load_dotenv
 
-# 1. Load Env Vars
-load_dotenv()
+app = FastAPI(title="Biometric API")
 
-# 2. Configuration
-# Point to external drive for models (keep your existing setup)
-os.environ["DEEPFACE_HOME"] = "F:/Amos/AI_models" 
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+STORAGE_ROOT = "storage"
+GLOBAL_DIR = "_global_login" # Special folder for login faces
 
-# 3. Initialize Supabase
-url = os.environ.get("SUPABASE_URL")
-key = os.environ.get("SUPABASE_KEY")
+# --- HELPER: Smart Path Selector ---
+def get_storage_path(user_id: str, workspace_id: str):
+    # If it's for the Login System, use the special global folder
+    if workspace_id == "global":
+        path = os.path.join(STORAGE_ROOT, GLOBAL_DIR)
+    else:
+        # Otherwise, use the User's specific Workspace folder
+        path = os.path.join(STORAGE_ROOT, user_id, workspace_id)
+    
+    if not os.path.exists(path):
+        os.makedirs(path)
+    return path
 
-if not url or not key:
-    print("❌ ERROR: Missing SUPABASE_URL or SUPABASE_KEY in .env")
+# --- HELPER: Load DB ---
+def load_db(path):
+    pkl_path = os.path.join(path, "embeddings.pkl")
+    if os.path.exists(pkl_path):
+        with open(pkl_path, "rb") as f:
+            return pickle.load(f)
+    return {}
 
-supabase: Client = create_client(url, key)
-
-app = FastAPI(title="Cloud Biometric API")
+# --- HELPER: Save DB ---
+def save_db(path, database):
+    pkl_path = os.path.join(path, "embeddings.pkl")
+    with open(pkl_path, "wb") as f:
+        pickle.dump(database, f)
 
 @app.get("/")
 def home():
-    return {"status": "online", "system": "Cloud-Native Biometric Engine ☁️"}
+    return {"status": "online", "system": "Hybrid (Global + Workspace) Engine"}
 
 @app.post("/register")
 async def register_face(
@@ -36,130 +55,92 @@ async def register_face(
     file: UploadFile = File(...)
 ):
     try:
-        # 1. Read File
-        file_content = await file.read()
+        # 1. Determine where to save
+        target_path = get_storage_path(user_id, workspace_id)
         
-        # 2. Save Temp for Processing
-        temp_filename = f"temp_reg_{file.filename}"
-        with open(temp_filename, "wb") as f:
-            f.write(file_content)
+        # 2. Save Image
+        # If global, name MUST be unique (usually the User ID or Email)
+        safe_name = "".join([c for c in name if c.isalpha() or c.isdigit() or c=='_' or c=='.' or c=='@']).strip()
+        img_path = os.path.join(target_path, f"{safe_name}.jpg")
 
-        # 3. Generate Embedding (The Math)
-        # Force numpy array to python list for JSON serialization
-        embeddings = DeepFace.represent(
-            img_path=temp_filename, 
-            model_name="Facenet512", 
-            enforce_detection=False
-        )
+        with open(img_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        # 3. Embedding
+        embeddings = DeepFace.represent(img_path, model_name="Facenet512", enforce_detection=False)
         embedding_vector = embeddings[0]["embedding"]
 
-        # 4. Upload Image to Supabase Storage (Bucket: 'biometric_faces')
-        # Path: user_id/workspace_id/name.jpg
-        storage_path = f"{user_id}/{workspace_id}/{name}.jpg"
-        
-        # Upload (Upsert=true overwrites if exists)
-        supabase.storage.from_("biometric_faces").upload(
-            path=storage_path,
-            file=file_content,
-            file_options={"content-type": file.content_type, "upsert": "true"}
-        )
+        # 4. Update Index
+        db = load_db(target_path)
+        db[safe_name] = embedding_vector
+        save_db(target_path, db)
 
-        # 5. Insert Metadata + Vector into Database
-        data = {
-            "user_id": user_id,
-            "workspace_id": workspace_id,
-            "name": name,
-            "image_path": storage_path,
-            "embedding": embedding_vector # Postgres vector extension handles the list
-        }
-        
-        supabase.table("face_embeddings").insert(data).execute()
-
-        # Cleanup
-        os.remove(temp_filename)
-
-        return {
-            "status": "success",
-            "message": f"Cloud enrollment complete for {name}",
-            "total_faces": 0, 
-            "image_path": storage_path
-            }
+        return {"status": "success", "message": "Enrolled successfully", "total_faces": len(db)}
 
     except Exception as e:
         print(f"Error: {e}")
-        if os.path.exists(temp_filename): os.remove(temp_filename)
         return JSONResponse(status_code=500, content={"message": str(e)})
 
 @app.post("/verify")
 async def verify_face(
-    user_id: str = Form(...),
+    user_id: str = Form(default="unknown"), # Optional for global login
     workspace_id: str = Form(...),
     file: UploadFile = File(...)
 ):
     try:
-        # 1. Read & Temp Save
-        temp_filename = f"temp_ver_{file.filename}"
-        with open(temp_filename, "wb") as f:
-            f.write(await file.read())
+        # 1. Save temp
+        temp_filename = f"temp_{file.filename}"
+        with open(temp_filename, "wb") as buffer:
+            buffer.write(await file.read())
 
-        # 2. Liveness Check (Optional - keep lightweight)
+        # 2. Liveness
         try:
             analysis = DeepFace.analyze(temp_filename, actions=['emotion'], enforce_detection=False)
-            if isinstance(analysis, list): analysis = analysis[0]
-            emotion = analysis['dominant_emotion']
+            emotion = analysis[0]['dominant_emotion'] if isinstance(analysis, list) else analysis['dominant_emotion']
             
-            # Simple liveness rule
+            # Allow neutral for easier testing
             if emotion not in ['happy', 'surprise', 'neutral']:
                 os.remove(temp_filename)
                 return JSONResponse(status_code=401, content={
-                    "access": "DENIED", 
-                    "error": "Liveness Failed", 
+                    "access": "DENIED", "error": "Liveness Failed", 
                     "message": f"User looked '{emotion}'. Smile required."
                 })
         except:
             emotion = "unknown"
 
-        # 3. Generate Target Embedding
-        target_embedding = DeepFace.represent(
-            img_path=temp_filename, 
-            model_name="Facenet512", 
-            enforce_detection=False
-        )[0]["embedding"]
-
-        # 4. Perform Vector Search via RPC (Remote Procedure Call)
-        # We call the SQL function 'match_faces' we created in Step 1
-        rpc_params = {
-            "query_embedding": target_embedding,
-            "match_threshold": 0.4, # 0.4 threshold (same as before)
-            "filter_workspace_id": workspace_id
-        }
-        
-        response = supabase.rpc("match_faces", rpc_params).execute()
-        matches = response.data
-
-        # Cleanup
+        # 3. Recognition
+        target_embedding = DeepFace.represent(temp_filename, model_name="Facenet512", enforce_detection=False)[0]["embedding"]
         os.remove(temp_filename)
 
-        # 5. Handle Result
-        if matches and len(matches) > 0:
-            best_match = matches[0] # { name: "Jon Snow", similarity: 0.85 }
+        # 4. Load Correct DB
+        target_path = get_storage_path(user_id, workspace_id)
+        db = load_db(target_path)
+
+        # 5. Search
+        best_match = "Unknown"
+        best_score = 1.0
+        
+        for name, db_embedding in db.items():
+            score = cosine(target_embedding, db_embedding)
+            if score < best_score:
+                best_score = score
+                best_match = name
+
+        # 6. Result
+        if best_score < 0.4:
             return {
                 "access": "GRANTED",
-                "user": best_match['name'],
-                "confidence": round(best_match['similarity'] * 100, 2),
+                "user": best_match, # This will be the UserID/Email if using Global
+                "confidence": round((1 - best_score) * 100, 2),
                 "emotion_detected": emotion
             }
         else:
             return JSONResponse(status_code=401, content={
-                "access": "DENIED", 
-                "error": "Identity Unknown", 
-                "score": 0.0
+                "access": "DENIED", "error": "Identity Unknown", "score": round(best_score, 2)
             })
 
     except Exception as e:
-        if os.path.exists(temp_filename): os.remove(temp_filename)
         return JSONResponse(status_code=500, content={"error": str(e)})
-
 
 
 @app.post("/analyze")
