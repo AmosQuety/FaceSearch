@@ -78,12 +78,7 @@ async def register_face(
         # Cleanup
         os.remove(temp_filename)
 
-        return {
-            "status": "success",
-            "message": f"Cloud enrollment complete for {name}",
-            "total_faces": 0, 
-            "image_path": storage_path
-            }
+        return {"status": "success", "message": f"Cloud enrollment complete for {name}"}
 
     except Exception as e:
         print(f"Error: {e}")
