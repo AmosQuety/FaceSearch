@@ -5,17 +5,26 @@ from deepface import DeepFace
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# 1. Load Env Vars
+#  Load Env Vars
 load_dotenv()
 
-# 2. Configuration
-# Point to external drive for models (keep your existing setup)
-os.environ["DEEPFACE_HOME"] = "F:/Amos/AI_models" 
+# Configuration
+# Check if running locally on your laptop
+local_path = "F:/Amos/AI_models"
+if os.path.exists(local_path):
+    os.environ["DEEPFACE_HOME"] = local_path
+else:
+    # We are on the Cloud (Docker)
+    pass
+
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
-# 3. Initialize Supabase
+# Initialize Supabase
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
+
+# Locally set this to "false". On Hugging Face, we set it to "true".
+ENABLE_FULL_ANALYSIS = os.environ.get("ENABLE_FULL_ANALYSIS", "false").lower() == "true"
 
 if not url or not key:
     print("❌ ERROR: Missing SUPABASE_URL or SUPABASE_KEY in .env")
@@ -170,11 +179,17 @@ async def analyze_face(file: UploadFile = File(...)):
         with open(temp_filename, "wb") as buffer:
             buffer.write(await file.read())
 
+        actions_list = ['emotion'] # Default lightweight
+
+        if ENABLE_FULL_ANALYSIS:
+        # Only add heavy models if we are on the Cloud
+            actions_list = ['age', 'gender', 'emotion']
+
         # 2. Run DeepFace Analysis
         # actions: age, gender, race, emotion
         results = DeepFace.analyze(
             img_path=temp_filename, 
-            actions=[ 'emotion'],
+            actions=actions_list,
             enforce_detection=False
         )
 
@@ -191,11 +206,9 @@ async def analyze_face(file: UploadFile = File(...)):
         return {
             "success": True,
             "data": {
-                 # Convert numpy types to standard python types
-                # "age": int(result.get("age")), 
-                # "gender": str(result.get("dominant_gender")),
-                "age": 25,          # Placeholder
-                "gender": "unknown",# Placeholder
+                 
+                "age": int(result.get("age") if ENABLE_FULL_ANALYSIS else 25), 
+                "gender": str(result.get("dominant_gender") if ENABLE_FULL_ANALYSIS else "unknown"),
                 "emotion": str(result.get("dominant_emotion")),
                 "emotion_score": float(result["emotion"][result["dominant_emotion"]]) 
             }
