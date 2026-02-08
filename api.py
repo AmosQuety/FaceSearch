@@ -1,41 +1,82 @@
 import os
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse
+import torch
+from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 from deepface import DeepFace
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import cv2
+import base64
+from scipy.spatial.distance import cosine
+import tempfile
+import shutil
+import time
 
-#  Load Env Vars
+# Load Env Vars
 load_dotenv()
 
 # Configuration
-# Check if running locally on your laptop
-local_path = "F:/Amos/AI_models"
-if os.path.exists(local_path):
-    os.environ["DEEPFACE_HOME"] = local_path
+# Dynamic path for models
+MODEL_PATH = os.environ.get("MODEL_PATH", "/app/models")
+if os.path.exists("F:/Amos/AI_models"):
+    MODEL_PATH = "F:/Amos/AI_models"
+    os.environ["DEEPFACE_HOME"] = MODEL_PATH
 else:
     # We are on the Cloud (Docker)
-    pass
+    os.makedirs(MODEL_PATH, exist_ok=True)
+    os.environ["DEEPFACE_HOME"] = MODEL_PATH
+
+# Set HF_HOME for weights
+os.environ["HF_HOME"] = os.path.join(MODEL_PATH, "huggingface")
+
+# Device selection
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Running on: {DEVICE}")
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 # Initialize Supabase
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
-
-# Locally set this to "false". On Hugging Face, we set it to "true".
-ENABLE_FULL_ANALYSIS = os.environ.get("ENABLE_FULL_ANALYSIS", "false").lower() == "true"
-
 if not url or not key:
-    print("❌ ERROR: Missing SUPABASE_URL or SUPABASE_KEY in .env")
+    print("⚠️ WARNING: Missing SUPABASE_URL or SUPABASE_KEY")
+else:
+    supabase: Client = create_client(url, key)
 
-supabase: Client = create_client(url, key)
+app = FastAPI(title="Cloud Biometric & Voice AI Engine")
 
-app = FastAPI(title="Cloud Biometric API")
+# Lazy load TTS to avoid slow startup for other endpoints
+tts = None
+
+def get_tts():
+    global tts
+    if tts is None:
+        print("🎙️ Loading XTTS v2...")
+        try:
+            from TTS.api import TTS
+            tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(DEVICE)
+        except Exception as e:
+            print(f"❌ Failed to load TTS: {e}")
+            raise e
+    return tts
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    print(f"⏱️ {request.method} {request.url.path} took {duration:.2f}s")
+    return response
 
 @app.get("/")
 def home():
-    return {"status": "online", "system": "Cloud-Native Biometric Engine ☁️"}
+    return {
+        "status": "online", 
+        "system": "Cloud-Native Biometric & Voice Engine ☁️", 
+        "device": DEVICE,
+        "model_path": MODEL_PATH
+    }
 
 @app.post("/register")
 async def register_face(
@@ -44,17 +85,15 @@ async def register_face(
     workspace_id: str = Form(...),
     file: UploadFile = File(...)
 ):
+    temp_filename = ""
     try:
-        # 1. Read File
         file_content = await file.read()
-        
-        # 2. Save Temp for Processing
-        temp_filename = f"temp_reg_{file.filename}"
-        with open(temp_filename, "wb") as f:
-            f.write(file_content)
+        suffix = os.path.splitext(file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_content)
+            temp_filename = tmp.name
 
-        # 3. Generate Embedding (The Math)
-        # Force numpy array to python list for JSON serialization
+        # Generate Embedding
         embeddings = DeepFace.represent(
             img_path=temp_filename, 
             model_name="Facenet512", 
@@ -62,42 +101,32 @@ async def register_face(
         )
         embedding_vector = embeddings[0]["embedding"]
 
-        # 4. Upload Image to Supabase Storage (Bucket: 'biometric_faces')
-        # Path: user_id/workspace_id/name.jpg
-        storage_path = f"{user_id}/{workspace_id}/{name}.jpg"
-        
-        # Upload (Upsert=true overwrites if exists)
+        # Upload to Supabase Storage
+        storage_path = f"{user_id}/{workspace_id}/{name}{suffix}"
         supabase.storage.from_("biometric_faces").upload(
             path=storage_path,
             file=file_content,
             file_options={"content-type": file.content_type, "upsert": "true"}
         )
 
-        # 5. Insert Metadata + Vector into Database
+        # Insert Metadata + Vector
         data = {
             "user_id": user_id,
             "workspace_id": workspace_id,
             "name": name,
             "image_path": storage_path,
-            "embedding": embedding_vector # Postgres vector extension handles the list
+            "embedding": embedding_vector
         }
-        
         supabase.table("face_embeddings").insert(data).execute()
 
-        # Cleanup
-        os.remove(temp_filename)
-
-        return {
-            "status": "success",
-            "message": f"Cloud enrollment complete for {name}",
-            "total_faces": 0, 
-            "image_path": storage_path
-            }
+        return {"success": True, "message": f"Cloud enrollment complete for {name}", "image_path": storage_path}
 
     except Exception as e:
-        print(f"Error: {e}")
-        if os.path.exists(temp_filename): os.remove(temp_filename)
-        return JSONResponse(status_code=500, content={"message": str(e)})
+        print(f"❌ Error in register: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+    finally:
+        if temp_filename and os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
 @app.post("/verify")
 async def verify_face(
@@ -105,53 +134,39 @@ async def verify_face(
     workspace_id: str = Form(...),
     file: UploadFile = File(...)
 ):
+    temp_filename = ""
     try:
-        # 1. Read & Temp Save
-        temp_filename = f"temp_ver_{file.filename}"
-        with open(temp_filename, "wb") as f:
-            f.write(await file.read())
+        suffix = os.path.splitext(file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            temp_filename = tmp.name
 
-        # 2. Liveness Check (Optional - keep lightweight)
+        # Liveness / Emotion check
+        emotion = "unknown"
         try:
             analysis = DeepFace.analyze(temp_filename, actions=['emotion'], enforce_detection=False)
             if isinstance(analysis, list): analysis = analysis[0]
             emotion = analysis['dominant_emotion']
-            
-            # Simple liveness rule
-            if emotion not in ['happy', 'surprise', 'neutral']:
-                os.remove(temp_filename)
-                return JSONResponse(status_code=401, content={
-                    "access": "DENIED", 
-                    "error": "Liveness Failed", 
-                    "message": f"User looked '{emotion}'. Smile required."
-                })
-        except:
-            emotion = "unknown"
+        except: pass
 
-        # 3. Generate Target Embedding
+        # Generate Target Embedding
         target_embedding = DeepFace.represent(
             img_path=temp_filename, 
             model_name="Facenet512", 
             enforce_detection=False
         )[0]["embedding"]
 
-        # 4. Perform Vector Search via RPC (Remote Procedure Call)
-        # We call the SQL function 'match_faces' we created in Step 1
+        # Vector Search
         rpc_params = {
             "query_embedding": target_embedding,
-            "match_threshold": 0.4, # 0.4 threshold (same as before)
+            "match_threshold": 0.4,
             "filter_workspace_id": workspace_id
         }
-        
         response = supabase.rpc("match_faces", rpc_params).execute()
         matches = response.data
 
-        # Cleanup
-        os.remove(temp_filename)
-
-        # 5. Handle Result
         if matches and len(matches) > 0:
-            best_match = matches[0] # { name: "Jon Snow", similarity: 0.85 }
+            best_match = matches[0]
             return {
                 "access": "GRANTED",
                 "user": best_match['name'],
@@ -159,188 +174,177 @@ async def verify_face(
                 "emotion_detected": emotion
             }
         else:
-            return JSONResponse(status_code=401, content={
-                "access": "DENIED", 
-                "error": "Identity Unknown", 
-                "score": 0.0
-            })
+            return JSONResponse(status_code=401, content={"access": "DENIED", "error": "Identity Unknown"})
 
     except Exception as e:
-        if os.path.exists(temp_filename): os.remove(temp_filename)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        print(f"❌ Error in verify: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+    finally:
+        if temp_filename and os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
+@app.post("/audio/register")
+async def register_voice(
+    user_id: str = Form(...),
+    reference_audio: UploadFile = File(...)
+):
+    temp_ref = ""
+    try:
+        # Save reference audio to temp
+        suffix = os.path.splitext(reference_audio.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(reference_audio.file, tmp)
+            temp_ref = tmp.name
 
+        # Extract Speaker Embedding (Latents)
+        print(f"🎙️ Extracting speaker embeddings for user {user_id}...")
+        engine = get_tts()
+        
+        # XTTS v2 specific latent extraction
+        gpt_cond_latent, speaker_embedding = engine.model.get_conditioning_latents(audio_path=temp_ref)
+        
+        # Convert to list for JSON storage
+        # gpt_cond_latent: [1, 1, 1024], speaker_embedding: [1, 16, 64]
+        data = {
+            "user_id": user_id,
+            "gpt_cond_latent": gpt_cond_latent.cpu().numpy().tolist(),
+            "speaker_embedding": speaker_embedding.cpu().numpy().tolist(),
+            "created_at": "now()"
+        }
+
+        # Store in Supabase
+        supabase.table("voice_embeddings").upsert(data).execute()
+
+        return {"success": True, "message": f"Voice registered for user {user_id}"}
+
+    except Exception as e:
+        print(f"❌ Error in voice register: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+    finally:
+        if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
+
+@app.post("/audio/clone")
+async def clone_voice(
+    text: str = Form(...),
+    user_id: str = Form(None),
+    reference_audio: UploadFile = File(None),
+    background_tasks: BackgroundTasks = None
+):
+    temp_ref = ""
+    temp_out = ""
+    try:
+        engine = get_tts()
+        gpt_cond_latent = None
+        speaker_embedding = None
+
+        if reference_audio:
+            # use uploaded audio
+            suffix = os.path.splitext(reference_audio.filename)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                shutil.copyfileobj(reference_audio.file, tmp)
+                temp_ref = tmp.name
+        elif user_id:
+            # lookup in database
+            print(f"🔍 Looking up voice for user {user_id}...")
+            response = supabase.table("voice_embeddings").select("*").eq("user_id", user_id).execute()
+            if response.data and len(response.data) > 0:
+                record = response.data[0]
+                gpt_cond_latent = torch.tensor(record["gpt_cond_latent"]).to(DEVICE)
+                speaker_embedding = torch.tensor(record["speaker_embedding"]).to(DEVICE)
+                print("✅ Found stored voice embeddings.")
+            else:
+                return JSONResponse(status_code=404, content={"success": False, "error": "No voice registered for this user"})
+        else:
+            return JSONResponse(status_code=400, content={"success": False, "error": "Either reference_audio or user_id must be provided"})
+
+        # Prepare Output Path
+        out_fd, temp_out = tempfile.mkstemp(suffix=".wav")
+        os.close(out_fd)
+
+        # Generate Voice
+        if gpt_cond_latent is not None:
+            # Use stored latents
+            engine.model.inference(
+                text=text,
+                language="en",
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                file_path=temp_out
+            )
+        else:
+            # Use reference audio
+            engine.tts_to_file(
+                text=text,
+                speaker_wav=temp_ref,
+                language="en",
+                file_path=temp_out
+            )
+
+        # Cleanup reference
+        if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
+
+        # Return file response and cleanup output in background
+        if background_tasks:
+            background_tasks.add_task(os.remove, temp_out)
+        
+        return FileResponse(temp_out, media_type="audio/wav", filename="cloned_voice.wav")
+
+    except Exception as e:
+        print(f"❌ Error in voice clone: {e}")
+        if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
+        if temp_out and os.path.exists(temp_out): os.remove(temp_out)
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
 
 @app.post("/analyze")
 async def analyze_face(file: UploadFile = File(...)):
+    temp_filename = ""
     try:
-        # 1. Save temp file
-        temp_filename = f"temp_analyze_{file.filename}"
-        with open(temp_filename, "wb") as buffer:
-            buffer.write(await file.read())
+        suffix = os.path.splitext(file.filename)[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            temp_filename = tmp.name
 
-        actions_list = ['emotion'] # Default lightweight
-
-        if ENABLE_FULL_ANALYSIS:
-        # Only add heavy models if we are on the Cloud
-            actions_list = ['age', 'gender', 'emotion']
-
-        # 2. Run DeepFace Analysis
-        # actions: age, gender, race, emotion
         results = DeepFace.analyze(
             img_path=temp_filename, 
-            actions=actions_list,
+            actions=['emotion', 'age', 'gender'],
             enforce_detection=False
         )
+        result = results[0] if isinstance(results, list) else results
 
-        # DeepFace returns a list (in case of multiple faces), we take the first
-        if isinstance(results, list):
-            result = results[0]
-        else:
-            result = results
-
-        # 3. Cleanup
-        os.remove(temp_filename)
-
-        # 4. Return Data
         return {
             "success": True,
             "data": {
-                 
-                "age": int(result.get("age") if ENABLE_FULL_ANALYSIS else 25), 
-                "gender": str(result.get("dominant_gender") if ENABLE_FULL_ANALYSIS else "unknown"),
+                "age": int(result.get("age")),
+                "gender": str(result.get("dominant_gender")),
                 "emotion": str(result.get("dominant_emotion")),
                 "emotion_score": float(result["emotion"][result["dominant_emotion"]]) 
             }
         }
-
     except Exception as e:
-        # Print the ACTUAL error to the terminal so we can see it
-        import traceback
-        traceback.print_exc()
-        
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
-
+    finally:
+        if temp_filename and os.path.exists(temp_filename):
+            os.remove(temp_filename)
 
 @app.post("/compare")
 async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(...)):
+    tmp1, tmp2 = "", ""
     try:
-        # 1. Save temp files
-        filename1 = f"compare_1_{file1.filename}"
-        filename2 = f"compare_2_{file2.filename}"
-        
-        with open(filename1, "wb") as f: f.write(await file1.read())
-        with open(filename2, "wb") as f: f.write(await file2.read())
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f1:
+            f1.write(await file1.read())
+            tmp1 = f1.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f2:
+            f2.write(await file2.read())
+            tmp2 = f2.name
 
-        # 2. Run Verification (Uses Facenet512 - Already downloaded!)
-        result = DeepFace.verify(
-            img1_path=filename1, 
-            img2_path=filename2, 
-            model_name="Facenet512",
-            enforce_detection=False
-        )
-
-        # 3. Cleanup
-        os.remove(filename1)
-        os.remove(filename2)
-
-        # 4. Calculate "Similarity Score" (Convert Distance to %)
-        # Facenet512 Threshold is usually 0.4.
-        # Distance 0.0 = 100% Match
-        # Distance 0.4 = 50% Match (Threshold)
-        # Distance 1.0 = 0% Match
-        
-        distance = result['distance']
-        threshold = result['threshold']
-        
-        # Simple percentage logic (approximate)
-        if distance > 1.0: distance = 1.0
-        similarity = (1.0 - distance) * 100
-
-        return {
-            "success": True,
-            "data": {
-                "verified": result['verified'],
-                "distance": distance,
-                "similarity_score": round(similarity, 1),
-                "threshold": threshold
-            }
-        }
-
+        result = DeepFace.verify(img1_path=tmp1, img2_path=tmp2, model_name="Facenet512", enforce_detection=False)
+        return {"success": True, "data": result}
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+    finally:
+        if tmp1 and os.path.exists(tmp1): os.remove(tmp1)
+        if tmp2 and os.path.exists(tmp2): os.remove(tmp2)
 
-
-
-@app.post("/find-face")
-async def find_face_in_crowd(
-    target: UploadFile = File(...), 
-    crowd: UploadFile = File(...)
-):
-    try:
-        # 1. Save temp files
-        target_path = f"temp_target_{target.filename}"
-        crowd_path = f"temp_crowd_{crowd.filename}"
-        
-        with open(target_path, "wb") as f: f.write(await target.read())
-        with open(crowd_path, "wb") as f: f.write(await crowd.read())
-
-        # 2. Get Target Embedding (The person we are looking for)
-        target_embedding = DeepFace.represent(
-            img_path=target_path, 
-            model_name="Facenet512", 
-            enforce_detection=True 
-        )[0]["embedding"]
-
-        # 3. Scan the Crowd (Get embeddings & coordinates for EVERYONE)
-        # This returns a list of objects for every face found
-        crowd_faces = DeepFace.represent(
-            img_path=crowd_path,
-            model_name="Facenet512",
-            enforce_detection=True,
-            detector_backend="retinaface" #or "mtcnn"
-        )
-
-        # 4. Load Image with OpenCV for drawing
-        img = cv2.imread(crowd_path)
-        matches_found = 0
-
-        for face in crowd_faces:
-            # Get coordinates
-            x = face["facial_area"]["x"]
-            y = face["facial_area"]["y"]
-            w = face["facial_area"]["w"]
-            h = face["facial_area"]["h"]
-            
-            # Compare current face with target
-            current_embedding = face["embedding"]
-            distance = cosine(target_embedding, current_embedding)
-            
-            # Threshold for Facenet512 is 0.4
-            if distance < 0.5:
-                # MATCH! Draw GREEN Box
-                cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 4) # Green
-                cv2.putText(img, "FOUND", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                matches_found += 1
-            else:
-                # NO MATCH. Draw RED Box (Optional: or Blur)
-                cv2.rectangle(img, (x, y), (x+w, y+h), (0, 0, 255), 2) # Red
-
-        # 5. Convert processed image to Base64 to send back to React
-        _, buffer = cv2.imencode('.jpg', img)
-        img_base64 = base64.b64encode(buffer).decode('utf-8')
-
-        # 6. Cleanup
-        os.remove(target_path)
-        os.remove(crowd_path)
-
-        return {
-            "success": True,
-            "matches": matches_found,
-            "processed_image": f"data:image/jpeg;base64,{img_base64}"
-        }
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+deepface
+supabase
+python-dotenv
+opencv-python-headless
+scipy
+torch
+tts
+numpy<2.0.0

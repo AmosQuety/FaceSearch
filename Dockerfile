@@ -1,26 +1,40 @@
-# 1. Use Python 3.9 (Stable)
-FROM python:3.9
+# Use high-performance Python base image
+FROM python:3.10-slim
 
-# 2. Set up a user (Hugging Face requires ID 1000)
-RUN useradd -m -u 1000 user
-USER user
-ENV PATH="/home/user/.local/bin:$PATH"
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MODEL_PATH=/app/models \
+    DEEPFACE_HOME=/app/models \
+    HF_HOME=/app/models/huggingface \
+    HOME=/app
 
-# 3. Set working directory
+# Set working directory
 WORKDIR /app
 
-# 4. Copy Requirements & Install
-COPY --chown=user ./requirements.txt requirements.txt
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsndfile1 \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# 5. Copy the Model Downloader & Run it (Baking the cache)
-COPY --chown=user ./download_models.py download_models.py
-# Set the deepface home to a writable directory inside the container
-ENV DEEPFACE_HOME="/app/.deepface"
-RUN python download_models.py
+# Create model directory and set permissions
+RUN mkdir -p /app/models && chmod -R 777 /app
 
-# 6. Copy the rest of the app
-COPY --chown=user . .
+# Install Python dependencies
+# Optimized for CPU usage if CUDA is not available
+COPY requirements_docker.txt .
+RUN pip install --no-cache-dir -r requirements_docker.txt
 
-# 7. Start the Server
+# Copy application code
+COPY . .
+
+# Expose port 7860 (Hugging Face default)
+EXPOSE 7860
+
+# Command to run the application
+# Use port 7860 as expected by HF Spaces
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860"]
