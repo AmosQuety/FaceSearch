@@ -7,3 +7,5 @@ streamlit run main.py
 uvicorn api:app --reload --port 8000
 
 sqlite3 dev.db .dump > export.sql
+
+

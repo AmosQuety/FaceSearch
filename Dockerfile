@@ -1,5 +1,5 @@
 # Use high-performance Python base image
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -16,7 +16,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -25,9 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /app/models && chmod -R 777 /app
 
 # Install Python dependencies
-# Optimized for CPU usage if CUDA is not available
-COPY requirements_docker.txt .
-RUN pip install --no-cache-dir -r requirements_docker.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
@@ -36,5 +36,4 @@ COPY . .
 EXPOSE 7860
 
 # Command to run the application
-# Use port 7860 as expected by HF Spaces
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860"]
