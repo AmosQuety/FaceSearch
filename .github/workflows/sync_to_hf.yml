@@ -16,4 +16,4 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git push --force https://AmosQuety/biometric-brain:$HF_TOKEN@huggingface.co/spaces/AmosQuety/biometric-brain main
+          git push --force https://AmosQuety:$HF_TOKEN@huggingface.co/spaces/AmosQuety/biometric-brain main
