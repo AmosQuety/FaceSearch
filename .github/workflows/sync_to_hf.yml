@@ -1,0 +1,19 @@
+name: Sync to Hugging Face
+on:
+  push:
+    branches: [main] # Or your default branch name
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true # Crucial if your repo uses LFS
+      - name: Push to Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git push --force https://AmosQuety/biometric-brain:$HF_TOKEN@huggingface.co/spaces/AmosQuety/biometric-brain main
