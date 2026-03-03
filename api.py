@@ -1,6 +1,7 @@
 import os
 import torch
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from deepface import DeepFace
 from supabase import create_client, Client
@@ -45,6 +46,15 @@ else:
     supabase: Client = create_client(url, key)
 
 app = FastAPI(title="Cloud Biometric & Voice AI Engine")
+
+# Add CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Lazy load TTS to avoid slow startup for other endpoints
 tts = None

@@ -6,6 +6,8 @@ streamlit run main.py
 
 uvicorn api:app --reload --port 8000
 
+(myenv) PS C:\new code\FaceSearchProject> pip install -r requirements.txt
+
 sqlite3 dev.db .dump > export.sql
 
 
