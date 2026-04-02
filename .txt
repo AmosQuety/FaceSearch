@@ -4,9 +4,13 @@ streamlit run main.py
 .\ngrok http 8501
 
 
+
 uvicorn api:app --reload --port 8000
+uvicorn api:app --port 8000    // rescoure sensitive
 
 (myenv) PS C:\new code\FaceSearchProject> pip install -r requirements.txt
+
+pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
 
 sqlite3 dev.db .dump > export.sql
 
