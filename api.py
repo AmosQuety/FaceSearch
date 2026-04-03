@@ -16,12 +16,15 @@ from scipy.spatial.distance import cosine
 import tempfile
 import shutil
 import time
-import builtins
-import sys
-import gc
 import wave
 import struct
 import threading
+import torch
+import numpy as np
+import io
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import torchaudio
 
 # Global lock to protect CPU exhaustion during concurrent CPU-bound AI operations
 tts_lock = threading.Lock()
@@ -145,6 +148,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -------------------------------------------------------
+# ENCRYPTION STUFF
+# -------------------------------------------------------
+def get_aes_gcm():
+    secret = os.environ.get("SUPABASE_KEY")
+    if not secret:
+        raise ValueError("Missing SUPABASE_KEY for encryption")
+    key = hashlib.sha256(secret.encode('utf-8')).digest()
+    return AESGCM(key)
+
+def encrypt_bytes(data: bytes) -> bytes:
+    if USE_MOCK_TTS: return data # Skip in mock mode
+    aesgcm = get_aes_gcm()
+    nonce = os.urandom(12)
+    return nonce + aesgcm.encrypt(nonce, data, None)
+
+def decrypt_bytes(data: bytes) -> bytes:
+    if USE_MOCK_TTS or len(data) < 12: return data # Skip in mock mode
+    aesgcm = get_aes_gcm()
+    nonce = data[:12]
+    ciphertext = data[12:]
+    return aesgcm.decrypt(nonce, ciphertext, None)
+
 
 # -------------------------------------------------------
 # MOCK TTS — activated by env var USE_MOCK_TTS=1
@@ -413,6 +440,134 @@ def _friendly_error(e: Exception) -> str:
         return "Required resource was not found. Please re-enroll your voice."
     return "Something went wrong during processing. Please try again."
 
+# Lazy load Whisper for STT (Anti-Replay)
+stt_model = None
+def get_stt_model():
+    global stt_model
+    if stt_model is None:
+        try:
+            import whisper
+            print(f"🎙️ Loading Whisper Tiny... [Memory: {get_memory_usage()}]")
+            # Using 'tiny.en' to save RAM on 4GB Windows environments
+            stt_model = whisper.load_model("tiny.en") 
+            print(f"✅ STT Model Loaded. [Memory: {get_memory_usage()}]")
+        except Exception as e:
+            print(f"⚠️ STT Loading Failed: {e}")
+            return None
+    return stt_model
+
+spk_model = None
+def get_spk_model():
+    global spk_model
+    if spk_model is None:
+        try:
+            print(f"🎙️ Loading SpeechBrain Speaker Recognition... [Memory: {get_memory_usage()}]")
+            from speechbrain.inference.speaker import EncoderClassifier
+            run_opts = {"device": DEVICE} if not IS_LOCAL_WINDOWS else {"device": "cpu"}
+            spk_model = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", run_opts=run_opts)
+            print(f"✅ SpeechBrain Loaded. [Memory: {get_memory_usage()}]")
+        except Exception as e:
+            print(f"⚠️ SpeechBrain Loading Failed: {e}")
+            return None
+    return spk_model
+
+@app.post("/audio/verify")
+async def verify_voice(
+    user_id: str = Form(...),
+    challenge_code: str = Form(...),
+    file: UploadFile = File(...)
+):
+    print(f"[AUDIO VERIFY] User: {user_id}. Challenge: {challenge_code}")
+    
+    file_bytes = await file.read()
+    if not file_bytes:
+        return JSONResponse(status_code=400, content={"access": "DENIED", "error": "Empty audio file"})
+
+    temp_ref = ""
+    wav_path = ""
+    try:
+        # 1. Prepare Audio
+        suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            temp_ref = tmp.name
+        
+        wav_path = ensure_wav(temp_ref)
+
+        # 2. Speaker Verification (Identity Check)
+        # Fetch enrolled embeddings from Supabase
+        record_resp = supabase.table("voice_embeddings").select("gpt_cond_latent_path").eq("user_id", user_id).execute()
+        if not record_resp.data:
+            return JSONResponse(status_code=404, content={"access": "DENIED", "error": "No voice profile enrolled"})
+        
+        record = record_resp.data[0]
+        sb_path = record["gpt_cond_latent_path"].replace("gpt_cond_latent.npy", "speechbrain.npy").replace(".enc", "") + ".enc"
+        
+        try:
+            sb_bytes = supabase.storage.from_("biometric_faces").download(sb_path)
+            sb_bytes = decrypt_bytes(sb_bytes)
+            stored_embedding = np.load(io.BytesIO(sb_bytes))
+        except Exception as e:
+            # Fallback to old format or handle missing 
+            return JSONResponse(status_code=500, content={"access": "ERROR", "error": "Could not retrieve voice profile. It may need to be re-enrolled for extreme accuracy."})
+
+        # Extract live embedding using SpeechBrain
+        spk_classifier = get_spk_model()
+        if not spk_classifier:
+            return JSONResponse(status_code=500, content={"access": "ERROR", "error": "SpeechBrain model not available"})
+            
+        with tts_lock:
+            signal, fs = torchaudio.load(wav_path)
+            live_embedding_tensor = spk_classifier.encode_batch(signal)
+            live_embedding = live_embedding_tensor.cpu().numpy().flatten()
+
+        # Cosine Similarity
+        stored_embedding = stored_embedding.flatten()
+        similarity = 1 - cosine(stored_embedding, live_embedding)
+        print(f"🎙️ Identity Similarity (SpeechBrain): {similarity:.4f}")
+
+        # IDENTITY THRESHOLD (0.8 as planned)
+        if similarity < 0.8:
+            return JSONResponse(status_code=401, content={"access": "DENIED", "error": "Voice mismatch", "similarity": round(float(similarity), 4)})
+
+        # 3. STT Verification (Anti-Replay Security)
+        stt = get_stt_model()
+        if stt:
+            print(f"🎙️ Transcribing for challenge code verification...")
+            transcription_result = stt.transcribe(wav_path)
+            text = transcription_result["text"].lower()
+            print(f"🎙️ Transcribed: '{text}'")
+
+            # Clean challenge code and check for its presence
+            digits = "".join(filter(str.isdigit, challenge_code))
+            # Also check for word version of digits if needed, but digits is usually enough for numeric codes
+            # Simple check: does the text contain the digits sequence or individual digits?
+            # For a 6-digit code like "123456", we look for "123456" or "1 2 3 4 5 6"
+            cleaned_text = "".join(filter(str.isdigit, text))
+            
+            if digits not in cleaned_text:
+                return JSONResponse(status_code=401, content={
+                    "access": "DENIED", 
+                    "error": "Challenge code mismatch", 
+                    "details": f"Expected {digits}, heard something else."
+                })
+        else:
+            print("⚠️ STT Engine unavailable, skipping phrase check (Liveness degraded)")
+
+        return {
+            "access": "GRANTED",
+            "message": "Voice access authorized",
+            "similarity": round(float(similarity), 4)
+        }
+
+    except Exception as e:
+        print(f"❌ Verification failed: {e}")
+        print(traceback.format_exc())
+        return JSONResponse(status_code=500, content={"access": "ERROR", "error": _friendly_error(e)})
+    finally:
+        if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
+        if wav_path and wav_path != temp_ref and os.path.exists(wav_path): os.remove(wav_path)
+
 @app.get("/audio/status/{job_id}")
 async def get_audio_status(job_id: str):
     job = ACTIVE_JOBS.get(job_id)
@@ -459,6 +614,13 @@ async def register_voice(
                     gpt_cond_latent, speaker_embedding = engine.synthesizer.tts_model.get_conditioning_latents(audio_path=wav_path)
                 else:
                     gpt_cond_latent, speaker_embedding = engine.model.get_conditioning_latents(audio_path=wav_path)
+                    
+                spk_classifier = get_spk_model()
+                if spk_classifier:
+                    signal, fs = torchaudio.load(wav_path)
+                    speechbrain_embedding = spk_classifier.encode_batch(signal)
+                else:
+                    speechbrain_embedding = None
 
             import io, numpy as np
             def tensor_to_npy_bytes(t):
@@ -466,11 +628,13 @@ async def register_voice(
                 np.save(buf, t.cpu().numpy())
                 return buf.getvalue()
 
-            gpt_bytes = tensor_to_npy_bytes(gpt_cond_latent)
-            spk_bytes = tensor_to_npy_bytes(speaker_embedding)
+            gpt_bytes = encrypt_bytes(tensor_to_npy_bytes(gpt_cond_latent))
+            spk_bytes = encrypt_bytes(tensor_to_npy_bytes(speaker_embedding))
+            sb_bytes = encrypt_bytes(tensor_to_npy_bytes(speechbrain_embedding)) if speechbrain_embedding is not None else None
 
-            gpt_path = f"voice-latents/{user_id}/gpt_cond_latent.npy"
-            spk_path = f"voice-latents/{user_id}/speaker_embedding.npy"
+            gpt_path = f"voice-latents/{user_id}/gpt_cond_latent.npy.enc"
+            spk_path = f"voice-latents/{user_id}/speaker_embedding.npy.enc"
+            sb_path = f"voice-latents/{user_id}/speechbrain.npy.enc"
 
             supabase.storage.from_("biometric_faces").upload(
                 path=gpt_path, file=gpt_bytes,
@@ -480,6 +644,12 @@ async def register_voice(
                 path=spk_path, file=spk_bytes,
                 file_options={"content-type": "application/octet-stream", "upsert": "true"}
             )
+            if sb_bytes:
+                supabase.storage.from_("biometric_faces").upload(
+                    path=sb_path, file=sb_bytes,
+                    file_options={"content-type": "application/octet-stream", "upsert": "true"}
+                )
+                
             supabase.table("voice_embeddings").upsert({
                 "user_id": user_id,
                 "gpt_cond_latent_path": gpt_path,
@@ -558,9 +728,13 @@ async def clone_voice(
                     record = record_resp.data[0]
                     gpt_bytes = supabase.storage.from_("biometric_faces").download(record["gpt_cond_latent_path"])
                     spk_bytes = supabase.storage.from_("biometric_faces").download(record["speaker_embedding_path"])
+                    
+                    gpt_bytes = decrypt_bytes(gpt_bytes)
+                    spk_bytes = decrypt_bytes(spk_bytes)
+                    
                     gpt_cond_latent = torch.tensor(np.load(io.BytesIO(gpt_bytes))).to(DEVICE)
                     speaker_embedding = torch.tensor(np.load(io.BytesIO(spk_bytes))).to(DEVICE)
-                    print(f"[{job_id}] ✅ Loaded voice latents")
+                    print(f"[{job_id}] ✅ Loaded and decrypted voice latents")
 
             out_fd, temp_out = tempfile.mkstemp(suffix=".wav")
             os.close(out_fd)
