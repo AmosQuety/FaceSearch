@@ -3,6 +3,8 @@ import subprocess
 import traceback
 import logging
 import sys
+import gc
+import builtins
 import torch
 from fastapi import FastAPI, File, UploadFile, Form, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
