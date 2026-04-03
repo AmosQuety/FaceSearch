@@ -20,18 +20,16 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          if [ -z "$HF_TOKEN" ]; then
-            echo "❌ Error: HF_TOKEN is not set in GitHub Repository Secrets."
-            echo "   Go to: Settings → Secrets and Variables → Actions → New Secret"
-            echo "   Name it HF_TOKEN and paste your Hugging Face write token."
-            exit 1
-          fi
-
+          # Configure Git
           git config --global user.email "actions@github.com"
           git config --global user.name "GitHub Actions"
 
-          git remote add huggingface https://oauth2:$HF_TOKEN@huggingface.co/spaces/AmosQuety/biometric-brain
+          # Add Remote with safe URL masking
+          git remote add hf https://AmosQuety:$HF_TOKEN@huggingface.co/spaces/AmosQuety/biometric-brain
 
-          echo "🚀 Pushing to Hugging Face Space..."
-          git push --force huggingface HEAD:main
+          echo "🚀 Syncing to Hugging Face Space..."
+          
+          # Force push to ensure the Space matches the main branch exactly
+          git push --force hf main
+          
           echo "✅ Successfully synced to Hugging Face Space."
