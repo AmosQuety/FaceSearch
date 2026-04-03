@@ -1,8 +1,8 @@
 name: Sync to Hugging Face
 on:
   push:
-    branches: [main] # Or your default branch name
-  workflow_dispatch: # Allows manual trigger
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   sync-to-hub:
@@ -11,16 +11,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: true # Crucial if your repo uses LFS
-      - name: Push to Hub
+          lfs: true
+
+      - name: Setup Git LFS
+        run: git lfs install
+
+      - name: Push to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           if [ -z "$HF_TOKEN" ]; then
-            echo "Error: HF_TOKEN is not set in GitHub secrets."
+            echo "❌ Error: HF_TOKEN is not set in GitHub Repository Secrets."
+            echo "   Go to: Settings → Secrets and Variables → Actions → New Secret"
+            echo "   Name it HF_TOKEN and paste your Hugging Face write token."
             exit 1
           fi
-          git config --global user.email "[EMAIL_ADDRESS]"
-          git config --global user.name "AmosQuety"
+
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+
           git remote add huggingface https://oauth2:$HF_TOKEN@huggingface.co/spaces/AmosQuety/biometric-brain
+
+          echo "🚀 Pushing to Hugging Face Space..."
           git push --force huggingface HEAD:main
+          echo "✅ Successfully synced to Hugging Face Space."
