@@ -342,15 +342,16 @@ async def register_face(
             file_options={"content-type": file.content_type, "upsert": "true"}
         )
 
-        # Insert Metadata + Vector
+        # Upsert Metadata + Vector (allows Updating Face ID)
         data = {
             "user_id": user_id,
             "workspace_id": workspace_id,
             "name": name,
             "image_path": storage_path,
-            "embedding": embedding_vector
+            "embedding": embedding_vector,
+            "created_at": "now()"
         }
-        supabase.table("face_embeddings").insert(data).execute()
+        supabase.table("face_embeddings").upsert(data, on_conflict="user_id,workspace_id,name").execute()
 
         return {"success": True, "message": f"Cloud enrollment complete for {name}", "image_path": storage_path}
 
