@@ -14,6 +14,7 @@ torch==2.4.0+cpu
 torchaudio==2.4.0+cpu
 transformers==4.33.0
 accelerate==0.23.0
+speechbrain
 bangla==0.0.2
 numpy<2.0.0
 sympy==1.13.1
@@ -22,31 +23,3 @@ opencv-python-headless
 numba
 typing-extensions
 openai-whisper
-
-
-
-
-# --extra-index-url https://download.pytorch.org/whl/cpu
-
-# fastapi
-# uvicorn
-# python-multipart
-# supabase
-# python-dotenv
-# streamlit
-# deepface
-# tensorflow>=2.15.0
-# tf-keras
-# TTS==0.22.0
-# torch==2.1.2+cpu
-# torchaudio==2.1.2+cpu
-# bangla==0.0.2
-# numpy<2.0.0
-# sympy==1.13.1
-# scipy
-# opencv-python-headless
-# numba
-# typing-extensions
-# openai-whisper
-
-
