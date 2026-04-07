@@ -23,3 +23,5 @@ opencv-python-headless
 numba
 typing-extensions
 openai-whisper
+retina-face
+mtcnn

@@ -870,32 +870,64 @@ async def find_face_in_crowd(target: UploadFile = File(...), crowd: UploadFile =
             raise ValueError("Could not decode crowd image")
         
         img_h, img_w = img_crowd.shape[:2]
+        print(f"📐 Crowd image size: {img_w}x{img_h}")
+
+        # --- PRE-PROCESSING: Normalize brightness for dark/low-contrast crowd photos ---
+        # This dramatically improves face detection in dim crowd shots
+        lab = cv2.cvtColor(img_crowd, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        img_crowd_enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        
+        # Upscale if image is small — detectors need faces to be at least ~80px wide
+        MAX_DIM = 2000  
+        scale = 1.0
+        if max(img_h, img_w) < MAX_DIM:
+            scale = MAX_DIM / max(img_h, img_w)
+            img_crowd_enhanced = cv2.resize(img_crowd_enhanced, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            print(f"📐 Upscaled crowd by {scale:.2f}x for better face detection")
+
+        # Save enhanced version for detection
+        tmp_enhanced = tmp_crowd.replace(".jpg", "_enhanced.jpg")
+        cv2.imwrite(tmp_enhanced, img_crowd_enhanced)
 
         from deepface import DeepFace
         import numpy as np
         from scipy.spatial.distance import cosine
 
-        # 3. Detect all faces in the crowd - use cascading detector strategy
-        # retinaface is best for crowds but may not be installed, fallback to mtcnn then opencv
+        # 3. Detect all faces using cascade of detectors (best → fallback)
         face_objs = []
         detectors = ['retinaface', 'mtcnn', 'opencv']
         for detector in detectors:
             try:
                 print(f"🔍 Trying detector: {detector}")
-                face_objs = DeepFace.extract_faces(
-                    img_path=tmp_crowd,
+                raw_objs = DeepFace.extract_faces(
+                    img_path=tmp_enhanced,
                     detector_backend=detector,
                     enforce_detection=False,
-                    align=True  # Align faces for better recognition accuracy
+                    align=True
                 )
-                # Filter out very low confidence / tiny face detections (< 20x20 pixels)
-                face_objs = [f for f in face_objs if f["facial_area"]["w"] > 20 and f["facial_area"]["h"] > 20]
+                # Scale bounding boxes back to original image coordinates
+                for obj in raw_objs:
+                    fa = obj["facial_area"]
+                    fa["x"] = int(fa["x"] / scale)
+                    fa["y"] = int(fa["y"] / scale)
+                    fa["w"] = int(fa["w"] / scale)
+                    fa["h"] = int(fa["h"] / scale)
+                # Filter tiny detections
+                face_objs = [f for f in raw_objs if f["facial_area"]["w"] > 15 and f["facial_area"]["h"] > 15]
                 print(f"✅ Detector '{detector}' found {len(face_objs)} usable faces.")
                 if face_objs:
                     break
             except Exception as e:
                 print(f"⚠️ Detector '{detector}' failed: {e}")
                 continue
+
+        # Cleanup enhanced temp file
+        if os.path.exists(tmp_enhanced):
+            os.remove(tmp_enhanced)
 
         print(f"📊 Total faces to compare: {len(face_objs)}")
 
