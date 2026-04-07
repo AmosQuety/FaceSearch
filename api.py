@@ -852,6 +852,95 @@ async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(
         if tmp1 and os.path.exists(tmp1): os.remove(tmp1)
         if tmp2 and os.path.exists(tmp2): os.remove(tmp2)
 
+@app.post("/find-face")
+async def find_face_in_crowd(target: UploadFile = File(...), crowd: UploadFile = File(...)):
+    tmp_target, tmp_crowd = "", ""
+    try:
+        # 1. Save temporary files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f1:
+            f1.write(await target.read())
+            tmp_target = f1.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f2:
+            f2.write(await crowd.read())
+            tmp_crowd = f2.name
+
+        # 2. Load Crowd Image for processing
+        img_crowd = cv2.imread(tmp_crowd)
+        if img_crowd is None:
+            raise ValueError("Could not decode crowd image")
+
+        from deepface import DeepFace
+        
+        # 3. Detect all faces in the crowd
+        # We use a robust detector but fallback to opencv if needed
+        detector_backend = 'opencv' # Safest for local Windows
+        try:
+            face_objs = DeepFace.extract_faces(
+                img_path=tmp_crowd, 
+                detector_backend=detector_backend, 
+                enforce_detection=False
+            )
+        except Exception as e:
+            print(f"Extraction error: {e}")
+            face_objs = []
+
+        match_count = 0
+        
+        # 4. Compare each face found in the crowd with the target
+        for face_obj in face_objs:
+            facial_area = face_obj["facial_area"]
+            x, y, w, h = facial_area["x"], facial_area["y"], facial_area["w"], facial_area["h"]
+            
+            # Crop the face from the crowd image
+            face_crop = img_crowd[y:y+h, x:x+w]
+            
+            # DeepFace.verify expects paths or images. We'll use the target path and the crop.
+            is_match = False
+            try:
+                # We use a loose threshold for 'finding' someone in a crowd
+                result = DeepFace.verify(
+                    img1_path=tmp_target, 
+                    img2_path=face_crop, 
+                    model_name="Facenet512",
+                    detector_backend='skip', # Already detected
+                    enforce_detection=False
+                )
+                is_match = result["verified"]
+            except: pass
+
+            # 5. Draw visualization
+            if is_match:
+                match_count += 1
+                color = (0, 255, 0) # Green for match
+                thickness = 4
+                label = "MATCH"
+            else:
+                color = (130, 130, 130) # Neutral grey for others
+                thickness = 1
+                label = ""
+
+            cv2.rectangle(img_crowd, (x, y), (x + w, y + h), color, thickness)
+            if label:
+                cv2.putText(img_crowd, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+        # 6. Encode result to Base64
+        _, buffer = cv2.imencode('.jpg', img_crowd)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        result_url = f"data:image/jpeg;base64,{img_base64}"
+
+        return {
+            "success": True,
+            "matches": match_count,
+            "processed_image": result_url
+        }
+
+    except Exception as e:
+        print(f"❌ Find Face Error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+    finally:
+        if tmp_target and os.path.exists(tmp_target): os.remove(tmp_target)
+        if tmp_crowd and os.path.exists(tmp_crowd): os.remove(tmp_crowd)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
