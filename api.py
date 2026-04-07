@@ -868,74 +868,130 @@ async def find_face_in_crowd(target: UploadFile = File(...), crowd: UploadFile =
         img_crowd = cv2.imread(tmp_crowd)
         if img_crowd is None:
             raise ValueError("Could not decode crowd image")
+        
+        img_h, img_w = img_crowd.shape[:2]
 
         from deepface import DeepFace
-        
-        # 3. Detect all faces in the crowd
-        # We use a robust detector but fallback to opencv if needed
-        detector_backend = 'opencv' # Safest for local Windows
-        try:
-            face_objs = DeepFace.extract_faces(
-                img_path=tmp_crowd, 
-                detector_backend=detector_backend, 
-                enforce_detection=False
-            )
-        except Exception as e:
-            print(f"Extraction error: {e}")
-            face_objs = []
+        import numpy as np
+        from scipy.spatial.distance import cosine
+
+        # 3. Detect all faces in the crowd - use cascading detector strategy
+        # retinaface is best for crowds but may not be installed, fallback to mtcnn then opencv
+        face_objs = []
+        detectors = ['retinaface', 'mtcnn', 'opencv']
+        for detector in detectors:
+            try:
+                print(f"🔍 Trying detector: {detector}")
+                face_objs = DeepFace.extract_faces(
+                    img_path=tmp_crowd,
+                    detector_backend=detector,
+                    enforce_detection=False,
+                    align=True  # Align faces for better recognition accuracy
+                )
+                # Filter out very low confidence / tiny face detections (< 20x20 pixels)
+                face_objs = [f for f in face_objs if f["facial_area"]["w"] > 20 and f["facial_area"]["h"] > 20]
+                print(f"✅ Detector '{detector}' found {len(face_objs)} usable faces.")
+                if face_objs:
+                    break
+            except Exception as e:
+                print(f"⚠️ Detector '{detector}' failed: {e}")
+                continue
+
+        print(f"📊 Total faces to compare: {len(face_objs)}")
+
+        # 4. Generate embedding for the TARGET face
+        print("🎯 Generating target face embedding...")
+        target_embedding_objs = DeepFace.represent(
+            img_path=tmp_target,
+            model_name="Facenet512",
+            enforce_detection=False,
+            detector_backend='retinaface'
+        )
+        if not target_embedding_objs:
+            raise ValueError("Could not detect a face in the target image.")
+        target_embedding = np.array(target_embedding_objs[0]["embedding"])
+        print(f"✅ Target embedding generated.")
 
         match_count = 0
-        
-        # 4. Compare each face found in the crowd with the target
-        for face_obj in face_objs:
+
+        # 5. Compare each crowd face against the target embedding
+        # THRESHOLD: Facenet512 cosine distance. Lower = more similar.
+        # 0.4 is DeepFace's strict default. We use 0.55 for a looser crowd-search match.
+        MATCH_THRESHOLD = 0.55
+
+        for i, face_obj in enumerate(face_objs):
             facial_area = face_obj["facial_area"]
             x, y, w, h = facial_area["x"], facial_area["y"], facial_area["w"], facial_area["h"]
-            
-            # Crop the face from the crowd image
-            face_crop = img_crowd[y:y+h, x:x+w]
-            
-            # DeepFace.verify expects paths or images. We'll use the target path and the crop.
-            is_match = False
-            try:
-                # We use a loose threshold for 'finding' someone in a crowd
-                result = DeepFace.verify(
-                    img1_path=tmp_target, 
-                    img2_path=face_crop, 
-                    model_name="Facenet512",
-                    detector_backend='skip', # Already detected
-                    enforce_detection=False
-                )
-                is_match = result["verified"]
-            except: pass
 
-            # 5. Draw visualization
+            # Add 30% padding around face for better context
+            pad_x = int(w * 0.30)
+            pad_y = int(h * 0.30)
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(img_w, x + w + pad_x)
+            y2 = min(img_h, y + h + pad_y)
+
+            face_crop = img_crowd[y1:y2, x1:x2]
+
+            if face_crop.size == 0:
+                continue
+
+            is_match = False
+            distance = 999.0
+            try:
+                # Get embedding from the padded crop, skip detection since we already detected
+                crop_embedding_objs = DeepFace.represent(
+                    img_path=face_crop,
+                    model_name="Facenet512",
+                    enforce_detection=False,
+                    detector_backend='skip'
+                )
+                if crop_embedding_objs:
+                    crop_embedding = np.array(crop_embedding_objs[0]["embedding"])
+                    # Manually compute cosine distance for full threshold control
+                    distance = cosine(target_embedding, crop_embedding)
+                    is_match = distance <= MATCH_THRESHOLD
+                    print(f"   Face #{i+1}: distance={distance:.4f} → {'✅ MATCH' if is_match else '❌ no match'}")
+            except Exception as e:
+                print(f"   Face #{i+1}: comparison error - {e}")
+
+            # 6. Draw visualization on original bounding box (not the padded one)
             if is_match:
                 match_count += 1
-                color = (0, 255, 0) # Green for match
+                color = (0, 255, 80)   # Bright Green for match
                 thickness = 4
-                label = "MATCH"
+                label = f"MATCH ({(1 - distance):.0%})"
             else:
-                color = (130, 130, 130) # Neutral grey for others
+                color = (100, 100, 100)  # Subtle grey for non-matches
                 thickness = 1
                 label = ""
 
             cv2.rectangle(img_crowd, (x, y), (x + w, y + h), color, thickness)
             if label:
-                cv2.putText(img_crowd, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                # Draw a filled label background for readability
+                (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.7, 2)
+                cv2.rectangle(img_crowd, (x, y - text_h - 14), (x + text_w + 8, y), (0, 200, 60), -1)
+                cv2.putText(img_crowd, label, (x + 4, y - 8), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 0, 0), 2)
 
-        # 6. Encode result to Base64
-        _, buffer = cv2.imencode('.jpg', img_crowd)
+        print(f"🏁 Scan complete. {match_count} match(es) found.")
+
+        # 7. Encode result to Base64
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 88]
+        _, buffer = cv2.imencode('.jpg', img_crowd, encode_params)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         result_url = f"data:image/jpeg;base64,{img_base64}"
 
         return {
             "success": True,
             "matches": match_count,
+            "faces_scanned": len(face_objs),
             "processed_image": result_url
         }
 
     except Exception as e:
         print(f"❌ Find Face Error: {e}")
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
     finally:
         if tmp_target and os.path.exists(tmp_target): os.remove(tmp_target)
