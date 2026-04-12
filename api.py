@@ -576,6 +576,25 @@ def home():
         "model_path": MODEL_PATH
     }
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+@app.get("/status/models")
+def models_status():
+    global _crowd_models_ready, tts, stt_model, spk_model
+    try:
+        return {
+            "crowd_models_preload": _crowd_models_ready,
+            "tts_loaded": tts is not None,
+            "stt_loaded": stt_model is not None,
+            "spk_loaded": spk_model is not None,
+            "device": DEVICE,
+            "memory": get_memory_usage()
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/register")
 async def register_face(
     name: str = Form(...), 
