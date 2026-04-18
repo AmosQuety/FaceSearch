@@ -610,6 +610,23 @@ async def log_requests(request: Request, call_next):
             "error": "An internal service error occurred."
         })
 
+@app.middleware("http")
+async def limit_upload_size(request: Request, call_next):
+    """
+    Reject requests whose Content-Length exceeds 50 MB.
+    Protects against memory exhaustion from outsized payloads.
+    This middleware runs BEFORE authentication so malformed requests
+    never reach a route handler.
+    """
+    MAX_BODY_BYTES = 50 * 1024 * 1024  # 50 MB
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_BODY_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"success": False, "error": "Payload too large. Maximum upload size is 50 MB."},
+        )
+    return await call_next(request)
+
 @app.get("/")
 def home():
     return {
@@ -621,7 +638,37 @@ def home():
 
 @app.get("/health")
 def health_check():
+    """
+    Liveness probe — no auth, no model calls.
+    Returns 200 immediately so load balancers and the Node service
+    know the process is alive without touching any ML state.
+    """
     return {"status": "ok"}
+
+@app.get("/ready")
+def readiness_check():
+    """
+    Readiness probe — returns 200 only when all startup models have loaded.
+    Returns 503 while deferred model preloading is still in progress.
+    No auth required (orchestrators / health checks call this without a key).
+    """
+    global _crowd_models_ready, tts, stt_model, spk_model
+    models_status = {
+        "crowd_scanner": _crowd_models_ready,
+        # TTS and STT are lazy-loaded; treat as ready if not yet requested
+        "tts": True,
+        "stt": True,
+    }
+    if not _crowd_models_ready:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "loading",
+                "message": "Crowd Scanner models are still warming up. Retry in a few seconds.",
+                "models": models_status,
+            },
+        )
+    return {"status": "ready", "models": models_status}
 
 @app.get("/status/models")
 def models_status():
