@@ -28,6 +28,50 @@ import hashlib
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import torchaudio
 
+from fastapi import Depends, Header, HTTPException
+import ipaddress
+from urllib.parse import urlparse
+
+SERVICE_API_KEY = os.environ.get("SERVICE_API_KEY")
+
+def verify_internal_service(x_service_key: str = Header(None)):
+    if not x_service_key or x_service_key != SERVICE_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid Service Key")
+
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+
+def is_ssrf_safe(url: str) -> bool:
+    """
+    Returns True if the URL is safe to send an outbound webhook to.
+    - development: always True (allows localhost for local testing)
+    - production: blocks localhost, all RFC-1918 private ranges,
+                  loopback, link-local, and known metadata endpoints
+    """
+    if ENVIRONMENT == "development":
+        return True
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        return False
+
+    # Block known internal/metadata hostnames
+    blocked_hostnames = {"localhost", "metadata.google.internal"}
+    if hostname in blocked_hostnames:
+        return False
+
+    # Block raw private/loopback/link-local IP addresses
+    # Covers 127.x.x.x, 10.x.x.x, 192.168.x.x, 172.16-31.x.x, 169.254.x.x
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return False
+    except ValueError:
+        pass  # It's a domain name, not a raw IP \u2014 continue
+
+    return True
+
 # Global lock to protect CPU exhaustion during concurrent CPU-bound AI operations
 tts_lock = threading.Lock()
 # ------------------------------
@@ -142,10 +186,14 @@ else:
 
 app = FastAPI(title="Cloud Biometric & Voice AI Engine")
 
-# Add CORS Middleware
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:4000"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -212,7 +260,7 @@ def _nms(face_objs, iou_threshold=0.4):
     return kept
 
 
-@app.post("/find-face")
+@app.post("/find-face", dependencies=[Depends(verify_internal_service)])
 async def find_face_in_crowd(target: UploadFile = File(...), crowd: UploadFile = File(...)):
     tmp_target, tmp_crowd, tmp_enhanced = "", "", ""
     try:
@@ -406,10 +454,8 @@ async def find_face_in_crowd(target: UploadFile = File(...), crowd: UploadFile =
         }
 
     except Exception as e:
-        print(f"❌ Find Face Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        logging.error(f"Find Face Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"success": False, "error": "An internal service processing error occurred."})
     finally:
         for p in [tmp_target, tmp_crowd, tmp_enhanced]:
             if p and os.path.exists(p):
@@ -558,13 +604,10 @@ async def log_requests(request: Request, call_next):
         return response
     except Exception as e:
         duration = time.time() - start_time
-        api_log.error(f"❌ CRITICAL CRASH: {request.method} {request.url.path} failed after {duration:.2f}s")
-        api_log.error(traceback.format_exc())
+        api_log.error(f"❌ CRITICAL CRASH: {request.method} {request.url.path} failed after {duration:.2f}s", exc_info=True)
         return JSONResponse(status_code=500, content={
             "success": False, 
-            "error": "Internal Server Error", 
-            "details": str(e),
-            "traceback": traceback.format_exc()
+            "error": "An internal service error occurred."
         })
 
 @app.get("/")
@@ -595,7 +638,7 @@ def models_status():
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/register")
+@app.post("/register", dependencies=[Depends(verify_internal_service)])
 async def register_face(
     name: str = Form(...), 
     user_id: str = Form(...),
@@ -641,13 +684,13 @@ async def register_face(
         return {"success": True, "message": f"Cloud enrollment complete for {name}", "image_path": storage_path}
 
     except Exception as e:
-        print(f"❌ Error in register: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        logging.error(f"Error in register: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"success": False, "error": "An internal service processing error occurred."})
     finally:
         if temp_filename and os.path.exists(temp_filename):
             os.remove(temp_filename)
 
-@app.post("/verify")
+@app.post("/verify", dependencies=[Depends(verify_internal_service)])
 async def verify_face(
     user_id: str = Form(...),
     workspace_id: str = Form(...),
@@ -697,8 +740,8 @@ async def verify_face(
             return JSONResponse(status_code=401, content={"access": "DENIED", "error": "Identity Unknown"})
 
     except Exception as e:
-        print(f"❌ Error in verify: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        logging.error(f"Error in verify: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"success": False, "error": "An internal service processing error occurred."})
     finally:
         if temp_filename and os.path.exists(temp_filename):
             os.remove(temp_filename)
@@ -759,7 +802,7 @@ def get_spk_model():
             return None
     return spk_model
 
-@app.post("/audio/verify")
+@app.post("/audio/verify", dependencies=[Depends(verify_internal_service)])
 async def verify_voice(
     user_id: str = Form(...),
     challenge_code: str = Form(...),
@@ -849,21 +892,20 @@ async def verify_voice(
         }
 
     except Exception as e:
-        print(f"❌ Verification failed: {e}")
-        print(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"access": "ERROR", "error": _friendly_error(e)})
+        logging.error(f"Verification failed: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"access": "ERROR", "error": "An internal service processing error occurred."})
     finally:
         if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
         if wav_path and wav_path != temp_ref and os.path.exists(wav_path): os.remove(wav_path)
 
-@app.get("/audio/status/{job_id}")
+@app.get("/audio/status/{job_id}", dependencies=[Depends(verify_internal_service)])
 async def get_audio_status(job_id: str):
     job = ACTIVE_JOBS.get(job_id)
     if not job:
         return JSONResponse(status_code=404, content={"success": False, "error": "Job not found or expired"})
     return job
 
-@app.post("/audio/register")
+@app.post("/audio/register", dependencies=[Depends(verify_internal_service)])
 async def register_voice(
     user_id: str = Form(...),
     webhook_url: str = Form(None),
@@ -949,18 +991,25 @@ async def register_voice(
             res = {"status": "COMPLETED", "success": True, "message": "Voice profile enrolled successfully"}
             ACTIVE_JOBS[job_id] = res
             if webhook_url:
-                import requests
-                try: requests.post(webhook_url, json={"jobId": job_id, **res}, timeout=5)
-                except Exception as e: print(f"Webhook error: {e}")
+                if not is_ssrf_safe(webhook_url):
+                    logging.warning(f"Blocked SSRF attempt to: {webhook_url}")
+                else:
+                    try:
+                        requests.post(webhook_url, json={"jobId": job_id, **res}, timeout=5)
+                    except Exception as e:
+                        logging.error(f"Webhook delivery failed: {e}")
         except Exception as e:
-            print(f"[{job_id}] ❌ Register failed: {e}")
-            print(traceback.format_exc())
+            logging.error(f"Register failed [{job_id}]: {e}", exc_info=True)
             err = {"status": "FAILED", "success": False, "error": _friendly_error(e)}
             ACTIVE_JOBS[job_id] = err
             if webhook_url:
-                import requests
-                try: requests.post(webhook_url, json={"jobId": job_id, **err}, timeout=5)
-                except: pass
+                if not is_ssrf_safe(webhook_url):
+                    logging.warning(f"Blocked SSRF attempt to: {webhook_url}")
+                else:
+                    try:
+                        import requests
+                        requests.post(webhook_url, json={"jobId": job_id, **err}, timeout=5)
+                    except: pass
         finally:
             if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
             if wav_path and wav_path != temp_ref and os.path.exists(wav_path): os.remove(wav_path)
@@ -968,7 +1017,7 @@ async def register_voice(
     background_tasks.add_task(_run_register, job_id, temp_ref, user_id, webhook_url)
     return {"success": True, "jobId": job_id, "status": "PROCESSING"}
 
-@app.post("/audio/clone")
+@app.post("/audio/clone", dependencies=[Depends(verify_internal_service)])
 async def clone_voice(
     text: str = Form(...),
     user_id: str = Form(None),
@@ -1065,18 +1114,25 @@ async def clone_voice(
             res = {"status": "COMPLETED", "success": True, "audioUrl": out_url}
             ACTIVE_JOBS[job_id] = res
             if webhook_url:
-                import requests
-                try: requests.post(webhook_url, json={"jobId": job_id, **res}, timeout=5)
-                except Exception as e: print(f"Webhook error: {e}")
+                if not is_ssrf_safe(webhook_url):
+                    logging.warning(f"Blocked SSRF attempt to: {webhook_url}")
+                else:
+                    try:
+                        requests.post(webhook_url, json={"jobId": job_id, **res}, timeout=5)
+                    except Exception as e:
+                        logging.error(f"Webhook delivery failed: {e}")
         except Exception as e:
-            print(f"[{job_id}] ❌ Clone failed: {e}")
-            print(traceback.format_exc())
+            logging.error(f"Clone failed [{job_id}]: {e}", exc_info=True)
             err = {"status": "FAILED", "success": False, "error": _friendly_error(e)}
             ACTIVE_JOBS[job_id] = err
             if webhook_url:
-                import requests
-                try: requests.post(webhook_url, json={"jobId": job_id, **err}, timeout=5)
-                except: pass
+                if not is_ssrf_safe(webhook_url):
+                    logging.warning(f"Blocked SSRF attempt to: {webhook_url}")
+                else:
+                    try: 
+                        import requests
+                        requests.post(webhook_url, json={"jobId": job_id, **err}, timeout=5)
+                    except: pass
         finally:
             if wav_ref and wav_ref != temp_ref and os.path.exists(wav_ref): os.remove(wav_ref)
             if temp_ref and os.path.exists(temp_ref): os.remove(temp_ref)
@@ -1085,7 +1141,7 @@ async def clone_voice(
     background_tasks.add_task(_run_clone, job_id, text, user_id, temp_ref, webhook_url)
     return {"success": True, "jobId": job_id, "status": "PROCESSING"}
 
-@app.post("/analyze")
+@app.post("/analyze", dependencies=[Depends(verify_internal_service)])
 async def analyze_face(file: UploadFile = File(...)):
     temp_filename = ""
     try:
@@ -1112,12 +1168,13 @@ async def analyze_face(file: UploadFile = File(...)):
             }
         }
     except Exception as e:
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        logging.error(f"Analyze Face Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"success": False, "error": "An internal service processing error occurred."})
     finally:
         if temp_filename and os.path.exists(temp_filename):
             os.remove(temp_filename)
 
-@app.post("/compare")
+@app.post("/compare", dependencies=[Depends(verify_internal_service)])
 async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(...)):
     tmp1, tmp2 = "", ""
     try:
@@ -1132,7 +1189,8 @@ async def compare_faces(file1: UploadFile = File(...), file2: UploadFile = File(
         result = DeepFace.verify(img1_path=tmp1, img2_path=tmp2, model_name="Facenet512", enforce_detection=False)
         return {"success": True, "data": result}
     except Exception as e:
-        return JSONResponse(status_code=500, content={"success": False, "error": str(e)})
+        logging.error(f"Compare Faces Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"success": False, "error": "An internal service processing error occurred."})
     finally:
         if tmp1 and os.path.exists(tmp1): os.remove(tmp1)
         if tmp2 and os.path.exists(tmp2): os.remove(tmp2)
